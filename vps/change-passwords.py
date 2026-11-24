@@ -22,8 +22,8 @@ def ask(label):
         password = getpass.getpass(label + " (Enter = keep current): ")
         if not password:
             return None
-        if len(password) < 12 or len(password) > 128 or not password.isascii() or not password.isprintable() or any(c.isspace() for c in password):
-            print("Use 12-128 characters: Latin letters, digits or symbols, no spaces.")
+        if len(password) < 6 or len(password) > 8 or not password.isascii() or not password.isprintable() or any(c.isspace() for c in password):
+            print("Use 6-8 characters: Latin letters, digits or symbols, no spaces.")
             continue
         if getpass.getpass("Repeat password: ") != password:
             print("Passwords do not match. Try again.")
