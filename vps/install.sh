@@ -50,6 +50,34 @@ systemctl enable math-school.service
 systemctl restart math-school.service
 for n in $(seq 1 10); do if curl -fsS http://127.0.0.1:3178/health; then break; fi; sleep 1; done
 curl -fsS http://127.0.0.1:3178/health >/dev/null
+python3 - <<'PY'
+import json, urllib.request, urllib.error
+c=json.load(open('/etc/math-school/credentials.json'))
+base='http://127.0.0.1:3178'
+def req(path,role=None,data=None):
+ headers={}
+ if role: headers['Cookie']='math_'+role+'='+c[role]['token']
+ if data is not None: headers['Content-Type']='application/json'
+ with urllib.request.urlopen(urllib.request.Request(base+path,data=None if data is None else json.dumps(data).encode(),headers=headers),timeout=5) as res:
+  return json.load(res)
+try:
+ req('/api/parent')
+ raise AssertionError('Unauthorized observer accepted')
+except urllib.error.HTTPError as e:
+ assert e.code==401
+s={'kind':'snapshot','seed':3141592654,'index':0,'canAnnotate':True,'record':{'values':[],'checked':[],'notes':'','strokes':[],'teacher':[],'teacherNote':''},'done':[False]*4}
+assert req('/api/student','student',{'paused':False,'snapshot':s,'ack':[]})['commands']==[]
+assert req('/api/parent','parent')['snapshot']['seed']==s['seed']
+assert req('/api/parent','parent',{'kind':'teacherNote','seed':s['seed'],'index':0,'note':'test'})['ok']
+cmd=req('/api/student','student',{'paused':False,'snapshot':s,'ack':[]})['commands'][0]
+assert cmd['msg']['note']=='test'
+assert not req('/api/student','student',{'paused':False,'snapshot':s,'ack':[cmd['id']]})['commands']
+req('/api/student','student',{'paused':True,'snapshot':None,'ack':[]})
+assert req('/api/parent','parent')['snapshot'] is None
+print('SYNC SMOKE TEST OK')
+PY
+# Clear the temporary test session.
+systemctl restart math-school.service
 if ! grep -Fq "$host" /etc/caddy/Caddyfile; then
  backup="/etc/caddy/Caddyfile.math-school.$(date +%s).bak"
  cp -a /etc/caddy/Caddyfile "$backup"
