@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, time, json, secrets, hmac, threading, html
+import os, time, json, secrets, hmac, threading, html, base64, binascii, tempfile
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
@@ -12,6 +12,46 @@ LOCK = threading.RLock()
 LIVE = {"snapshot": None, "student": 0.0, "parent": 0.0, "paused": False, "commands": []}
 TTL = 18
 MAX = 6 * 1024 * 1024
+ASSIGN_FILE = Path(os.environ.get("MATH_ASSIGNMENTS", "/var/lib/math-school/assignments.json"))
+ASSIGNMENTS = json.loads(ASSIGN_FILE.read_text()) if ASSIGN_FILE.exists() else []
+ASSIGN_BASE = 4000000000
+
+def public_assignments():
+    return [{k:v for k,v in a.items() if k != "photo"} | {"hasPhoto": bool(a.get("photo"))} for a in ASSIGNMENTS]
+
+def save_assignments(items):
+    fd, name = tempfile.mkstemp(dir=ASSIGN_FILE.parent, prefix=".assignments-")
+    try:
+        with os.fdopen(fd,"w") as f:
+            json.dump(items,f,ensure_ascii=False,separators=(",",":"))
+            f.flush(); os.fsync(f.fileno())
+        os.replace(name,ASSIGN_FILE)
+    finally:
+        if os.path.exists(name): os.unlink(name)
+
+def new_assignment(d):
+    title=d.get("title")
+    rows=d.get("tasks")
+    photo=d.get("photo","")
+    if not isinstance(title,str) or not 1<=len(title.strip())<=120 or not isinstance(rows,list) or not 1<=len(rows)<=12 or not isinstance(photo,str): raise ValueError("invalid assignment")
+    if photo:
+        if len(photo)>3000000: raise ValueError("photo too large")
+        raw=base64.b64decode(photo,validate=True)
+        if len(raw)>2200000 or not raw.startswith(b"\xff\xd8\xff") or not raw.endswith(b"\xff\xd9"): raise ValueError("invalid JPEG")
+    tasks=[]
+    for row in rows:
+        if not isinstance(row,dict): raise ValueError("invalid task")
+        clean={}
+        for key,n in (("text",2000),("answer",180),("hint",1000)):
+            value=row.get(key,"")
+            if not isinstance(value,str) or len(value)>n: raise ValueError("invalid "+key)
+            clean[key]=value.strip()
+        if not clean["text"] and not photo: raise ValueError("empty task")
+        tasks.append(clean)
+    if len(ASSIGNMENTS)>=50: raise ValueError("maximum 50 assignments")
+    seed=max([ASSIGN_BASE]+[a["seed"] for a in ASSIGNMENTS])+1
+    return {"seed":seed,"title":title.strip(),"created":int(time.time()),"tasks":tasks,"photo":photo}
+
 
 def active(now):
     if now - LIVE["student"] > TTL:
@@ -115,7 +155,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             return self.redirect("/student")
         if path == "/health":
-            return self.j(200, {"ok":True,"version":"3.0"})
+            return self.j(200, {"ok":True,"version":"3.2"})
         if path in ("/student","/parent"):
             role = path[1:]
             return self.send(200, PAGE if self.authorized(role) else login_page(role), "text/html; charset=utf-8")
@@ -124,6 +164,14 @@ class Handler(BaseHTTPRequestHandler):
                 with LOCK:
                     LIVE.update(snapshot=None, commands=[], student=0.0, paused=False)
             return self.redirect("/student",[("Set-Cookie", "math_"+r+"=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict") for r in ("student","parent")])
+        if path == "/api/assignments" or path.startswith("/api/assignment-photo/"):
+            if not (self.authorized("student") or self.authorized("parent")):
+                return self.j(401,{"error":"login"})
+            with LOCK:
+                if path == "/api/assignments": return self.j(200,{"assignments":public_assignments()})
+                a=next((a for a in ASSIGNMENTS if str(a["seed"])==path.rsplit("/",1)[1]),None)
+                if not a or not a.get("photo"): return self.j(404,{"error":"photo"})
+                return self.send(200,base64.b64decode(a["photo"]),"image/jpeg")
         if path == "/api/parent":
             if not self.authorized("parent"):
                 return self.j(401, {"error":"login"})
@@ -148,6 +196,22 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(0.4)
                 return self.send(401,login_page(role,True),"text/html; charset=utf-8")
             return self.redirect("/"+role,[("Set-Cookie","math_"+role+"="+CONFIG[role]["token"]+"; Path=/; Max-Age=15552000; Secure; HttpOnly; SameSite=Strict")])
+        if path == "/api/assignments":
+            if not self.authorized("parent"): return self.j(403,{"error":"parent only"})
+            if self.headers.get("Content-Type","").split(";")[0]!="application/json": return self.j(415,{"error":"content type"})
+            try:
+                d=json.loads(self.body())
+                if not isinstance(d,dict): raise ValueError("body")
+                with LOCK:
+                    a=new_assignment(d)
+                    items=ASSIGNMENTS+[a]
+                    save_assignments(items)
+                    ASSIGNMENTS.append(a)
+                    return self.j(201,{"seed":a["seed"],"assignments":public_assignments()})
+            except (ValueError,TypeError,binascii.Error) as e:
+                return self.j(400,{"error":str(e)})
+            except OSError:
+                return self.j(500,{"error":"storage"})
         if path not in ("/api/student","/api/parent"):
             return self.j(404,{"error":"not found"})
         role=path.rsplit("/",1)[1]
@@ -167,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
             if role=="student":
                 pause=d.get("paused") is True
                 snap=d.get("snapshot")
-                if not pause and not valid_snapshot(snap):
+                if not pause and (not valid_snapshot(snap) or (ASSIGN_BASE<snap["seed"]<=ASSIGN_BASE+50 and not any(a["seed"]==snap["seed"] and snap["index"]<len(a["tasks"]) for a in ASSIGNMENTS))):
                     return self.j(400,{"error":"snapshot"})
                 a=d.get("ack",[])
                 if not isinstance(a,list) or len(a)>400 or not all(isinstance(x,str) for x in a):
